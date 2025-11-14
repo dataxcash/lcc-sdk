@@ -15,25 +15,39 @@ import (
 
 // Client represents an LCC client instance
 type Client struct {
-	baseURL       string
-	productID     string
-	productVer    string
-	httpClient    *http.Client
-	keyPair       *auth.KeyPair
-	signer        *auth.RequestSigner
-	cache         *featureCache
-	instanceID    string
-	mu            sync.RWMutex
+	baseURL    string
+	productID  string
+	productVer string
+
+	httpClient *http.Client
+	keyPair    *auth.KeyPair
+	signer     *auth.RequestSigner
+	cache      *featureCache
+	instanceID string
+
+	mu sync.RWMutex
 }
 
 // FeatureStatus represents the status of a feature check
 type FeatureStatus struct {
-	Enabled   bool    `json:"enabled"`
-	Tier      string  `json:"tier"`
-	Reason    string  `json:"reason,omitempty"`
-	ExpiresAt int64   `json:"expiresAt,omitempty"`
-	Remaining float64 `json:"remaining,omitempty"`
-	Total     float64 `json:"total,omitempty"`
+	Enabled bool   `json:"enabled"`
+	Reason  string `json:"reason,omitempty"`
+
+	// Optional quota information (for consumption limits)
+	Quota *QuotaInfo `json:"quota_info,omitempty"`
+
+	// Optional demo limits for different control types
+	MaxCapacity    int     `json:"max_capacity,omitempty"`
+	MaxTPS         float64 `json:"max_tps,omitempty"`
+	MaxConcurrency int     `json:"max_concurrency,omitempty"`
+}
+
+// QuotaInfo mirrors the server-side SDKQuotaInfo structure
+type QuotaInfo struct {
+	Limit     int   `json:"limit"`
+	Used      int   `json:"used"`
+	Remaining int   `json:"remaining"`
+	ResetAt   int64 `json:"reset_at"`
 }
 
 // featureCache caches feature check results
@@ -47,6 +61,12 @@ type cacheEntry struct {
 	status    *FeatureStatus
 	expiresAt time.Time
 }
+
+// concurrencyState tracks in-process concurrency per (instanceID, featureID).
+// This is a package-level variable for simplicity in the demo. In a real
+// implementation this should be moved to a dedicated structure with proper
+// lifecycle management.
+var concurrencyState = make(map[string]int)
 
 // NewClient creates a new LCC client
 func NewClient(cfg *config.SDKConfig) (*Client, error) {
@@ -86,10 +106,15 @@ func (c *Client) Register() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	pubPEM, err := c.keyPair.GetPublicKeyPEM()
+	if err != nil {
+		return fmt.Errorf("failed to export public key: %w", err)
+	}
+
 	reqBody := map[string]interface{}{
 		"product_id": c.productID,
 		"version":    c.productVer,
-		"public_key": c.keyPair.GetPublicKeyPEM(),
+		"public_key": pubPEM,
 	}
 
 	bodyBytes, err := json.Marshal(reqBody)
@@ -166,10 +191,14 @@ func (c *Client) queryFeature(featureID string) (*FeatureStatus, error) {
 	}
 
 	var result struct {
-		FeatureID string `json:"feature_id"`
-		Enabled   bool   `json:"enabled"`
-		Reason    string `json:"reason"`
-		CacheTTL  int    `json:"cache_ttl"`
+		FeatureID      string     `json:"feature_id"`
+		Enabled        bool       `json:"enabled"`
+		Reason         string     `json:"reason"`
+		QuotaInfo      *QuotaInfo `json:"quota_info,omitempty"`
+		MaxCapacity    int        `json:"max_capacity,omitempty"`
+		MaxTPS         float64    `json:"max_tps,omitempty"`
+		MaxConcurrency int        `json:"max_concurrency,omitempty"`
+		CacheTTL       int        `json:"cache_ttl"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -177,9 +206,142 @@ func (c *Client) queryFeature(featureID string) (*FeatureStatus, error) {
 	}
 
 	return &FeatureStatus{
-		Enabled: result.Enabled,
-		Reason:  result.Reason,
+		Enabled:        result.Enabled,
+		Reason:         result.Reason,
+		Quota:          result.QuotaInfo,
+		MaxCapacity:    result.MaxCapacity,
+		MaxTPS:         result.MaxTPS,
+		MaxConcurrency: result.MaxConcurrency,
 	}, nil
+}
+
+// Consume performs a consumption-style check+usage for an event-based feature.
+// Typical use: MAXCALL, license generation, export count, etc.
+// It first checks the feature, then reports usage if allowed.
+func (c *Client) Consume(featureID string, amount int, meta map[string]any) (bool, int, string, error) {
+	status, err := c.CheckFeature(featureID)
+	if err != nil {
+		return false, 0, "check_error", err
+	}
+	if !status.Enabled {
+		remaining := 0
+		if status.Quota != nil {
+			remaining = status.Quota.Remaining
+		}
+		return false, remaining, status.Reason, nil
+	}
+
+	// Report usage as a single event (server-side quota tracking)
+	if err := c.ReportUsage(featureID, float64(amount)); err != nil {
+		return false, 0, "usage_error", err
+	}
+
+	remaining := 0
+	if status.Quota != nil {
+		// Note: this is approximate, real remaining will be updated on next check
+		remaining = status.Quota.Remaining - amount
+		if remaining < 0 {
+			remaining = 0
+		}
+	}
+
+	return true, remaining, "ok", nil
+}
+
+// CheckCapacity compares an APP-provided currentUsed against the license-defined
+// MaxCapacity for the given feature. SDK does not compute current usage itself.
+func (c *Client) CheckCapacity(featureID string, currentUsed int) (bool, int, string, error) {
+	status, err := c.CheckFeature(featureID)
+	if err != nil {
+		return false, 0, "check_error", err
+	}
+
+	max := status.MaxCapacity
+	if max <= 0 {
+		// No capacity configured for this feature
+		return false, 0, "no_capacity_limit", nil
+	}
+
+	if currentUsed > max {
+		return false, max, "capacity_exceeded", nil
+	}
+
+	return true, max, "ok", nil
+}
+
+// CheckTPS compares an APP-provided currentTPS against the license-defined
+// MaxTPS for the given feature.
+func (c *Client) CheckTPS(featureID string, currentTPS float64) (bool, float64, string, error) {
+	status, err := c.CheckFeature(featureID)
+	if err != nil {
+		return false, 0, "check_error", err
+	}
+
+	max := status.MaxTPS
+	if max <= 0 {
+		return false, 0, "no_tps_limit", nil
+	}
+
+	if currentTPS > max {
+		return false, max, "tps_exceeded", nil
+	}
+
+	return true, max, "ok", nil
+}
+
+// AcquireSlot implements a simple in-process concurrency control based on
+// MaxConcurrency from the feature check. It returns a release function that
+// must be called to free the slot.
+func (c *Client) AcquireSlot(featureID string, meta map[string]any) (func(), bool, string, error) {
+	status, err := c.CheckFeature(featureID)
+	if err != nil {
+		return func() {}, false, "check_error", err
+	}
+
+	max := status.MaxConcurrency
+	if max <= 0 {
+		return func() {}, false, "no_concurrency_limit", nil
+	}
+
+	// Simple per-feature counter; no cross-process coordination.
+	// For demo purposes only.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.cache == nil {
+		c.cache = &featureCache{data: make(map[string]*cacheEntry), ttl: 0}
+	}
+
+	// Reuse cache map to store a simple counter via cacheEntry.Total field is not ideal,
+	// but to keep changes minimal, we track concurrency in a dedicated map.
+	// For clarity, we keep a separate field on Client.
+
+	// Lazy init per-feature concurrency map
+	if cConcurrency, ok := concurrencyState[c.instanceID]; ok {
+		_ = cConcurrency
+	}
+
+	// Global in-process map: instanceID+featureID -> current count
+	key := c.instanceID + "::" + featureID
+	current := concurrencyState[key]
+	if current >= max {
+		return func() {}, false, "concurrency_exceeded", nil
+	}
+
+	concurrencyState[key] = current + 1
+
+	release := func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		cur := concurrencyState[key]
+		if cur <= 1 {
+			delete(concurrencyState, key)
+		} else {
+			concurrencyState[key] = cur - 1
+		}
+	}
+
+	return release, true, "ok", nil
 }
 
 // ReportUsage reports feature usage to LCC
