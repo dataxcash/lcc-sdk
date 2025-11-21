@@ -21,17 +21,33 @@ type SDKConfig struct {
 }
 
 // FeatureConfig defines a single protected feature
+// This structure maps feature IDs to functions (technical mapping)
+// Authorization control (enabled/disabled, quotas) is defined in the License file
 type FeatureConfig struct {
 	ID          string          `yaml:"id"`
 	Name        string          `yaml:"name"`
 	Description string          `yaml:"description"`
-	Tier        string          `yaml:"tier"`
+	
+	// Deprecated: Tier is no longer used for authorization checks.
+	// License file now controls feature enablement directly.
+	// This field is kept for backward compatibility only.
+	Tier        string          `yaml:"tier,omitempty"`
+	
 	Required    bool            `yaml:"required"`
 	Intercept   InterceptConfig `yaml:"intercept"`
 	Fallback    *InterceptConfig `yaml:"fallback,omitempty"`
+	
+	// Deprecated: Quota is no longer defined in YAML.
+	// Quota limits should be defined in the License file.
+	// This field is kept for backward compatibility only.
 	Quota       *QuotaConfig    `yaml:"quota,omitempty"`
+	
 	Condition   *ConditionConfig `yaml:"condition,omitempty"`
 	OnDeny      *OnDenyConfig   `yaml:"on_deny,omitempty"`
+	
+	// Metadata fields for documentation and organization (not used in authorization)
+	Category    string          `yaml:"category,omitempty"`
+	Tags        []string        `yaml:"tags,omitempty"`
 }
 
 // InterceptConfig specifies which function to intercept

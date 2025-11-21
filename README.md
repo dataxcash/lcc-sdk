@@ -33,13 +33,15 @@ sdk:
 features:
   - id: advanced_analytics
     name: "Advanced Analytics"
-    tier: professional
+    description: "ML-powered analytics features"
     intercept:
       package: "myapp/analytics"
       function: "AdvancedAnalytics"
     fallback:
       package: "myapp/analytics"
       function: "BasicAnalytics"
+    # Note: Authorization is controlled by License file, not YAML
+    # Do NOT specify tier or quota here
 ```
 
 2. **Add to build process:**
@@ -95,6 +97,57 @@ Generated Wrappers
 LCC Client (runtime)
        ↓
 LCC Server (license verification)
+```
+
+## Authorization Model
+
+### New Model (Recommended)
+
+**Separation of Concerns:**
+
+- **YAML Configuration** (`lcc-features.yaml`)
+  - Maps feature IDs to functions (technical mapping)
+  - Defines fallback behavior
+  - Does NOT control authorization
+
+- **License File** (`.lic`)
+  - Controls which features are enabled/disabled
+  - Defines quotas, rate limits, capacity limits
+  - Source of truth for authorization
+
+**Example License:**
+
+```json
+{
+  "planInfo": {
+    "features": {
+      "advanced_analytics": {
+        "enabled": true,
+        "quota": {"daily": 10000}
+      },
+      "excel_export": {
+        "enabled": false
+      }
+    }
+  }
+}
+```
+
+**Benefits:**
+- License has full control over feature enablement
+- Can customize per customer without code changes
+- Stable feature IDs as business interface
+- Flexible function implementation
+
+### Old Model (Deprecated)
+
+The old model where YAML defines `tier` requirements is deprecated but still supported for backward compatibility.
+
+```yaml
+# Old approach (deprecated)
+features:
+  - id: advanced_analytics
+    tier: professional  # Deprecated - don't use this
 ```
 
 ## Development

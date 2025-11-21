@@ -14,6 +14,13 @@ import (
 )
 
 // Client represents an LCC client instance
+// The client communicates with LCC server to check feature authorization.
+//
+// Authorization Model:
+// - Old model (deprecated): YAML defines tier requirements, License validates tier match
+// - New model (recommended): License directly controls which features are enabled
+//
+// The client is backward compatible and works with both old and new License formats.
 type Client struct {
 	baseURL    string
 	productID  string
@@ -68,36 +75,34 @@ type cacheEntry struct {
 // lifecycle management.
 var concurrencyState = make(map[string]int)
 
-// NewClient creates a new LCC client
+// NewClient creates a new LCC client using a freshly generated key pair
 func NewClient(cfg *config.SDKConfig) (*Client, error) {
-	// Generate key pair
-	keyPair, err := auth.GenerateKeyPair()
+	kp, err := auth.GenerateKeyPair()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate key pair: %w", err)
 	}
+	return NewClientWithKeyPair(cfg, kp)
+}
 
-	// Get instance ID (fingerprint of public key)
+// NewClientWithKeyPair creates a client using the provided key pair
+func NewClientWithKeyPair(cfg *config.SDKConfig, keyPair *auth.KeyPair) (*Client, error) {
+	if keyPair == nil {
+		return nil, fmt.Errorf("keyPair is nil")
+	}
 	instanceID, err := keyPair.GetFingerprint()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get fingerprint: %w", err)
 	}
-
 	client := &Client{
 		baseURL:    cfg.LCCURL,
 		productID:  cfg.ProductID,
 		productVer: cfg.ProductVersion,
-		httpClient: &http.Client{
-			Timeout: cfg.Timeout,
-		},
+		httpClient: &http.Client{ Timeout: cfg.Timeout },
 		keyPair:    keyPair,
 		signer:     auth.NewRequestSigner(keyPair),
 		instanceID: instanceID,
-		cache: &featureCache{
-			data: make(map[string]*cacheEntry),
-			ttl:  cfg.CacheTTL,
-		},
+		cache:      &featureCache{ data: make(map[string]*cacheEntry), ttl: cfg.CacheTTL },
 	}
-
 	return client, nil
 }
 
@@ -146,7 +151,20 @@ func (c *Client) Register() error {
 	return nil
 }
 
-// CheckFeature checks if a feature is enabled
+// CheckFeature checks if a feature is enabled in the License.
+// Authorization is controlled by the License file, not by YAML configuration.
+// The YAML config only maps feature IDs to functions (technical mapping).
+//
+// The License file determines:
+// - Whether the feature is enabled
+// - Quota limits (if applicable)
+// - Capacity, TPS, and concurrency limits
+//
+// Returns FeatureStatus with:
+// - Enabled: true if feature is authorized in license
+// - Reason: explanation if disabled (e.g., "feature_not_in_license", "quota_exceeded")
+// - Quota: quota information if applicable
+// - Capacity/TPS/Concurrency: limits from license
 func (c *Client) CheckFeature(featureID string) (*FeatureStatus, error) {
 	// Check cache first
 	if status := c.cache.get(featureID); status != nil {
