@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -31,6 +32,10 @@ type Client struct {
 	signer     *auth.RequestSigner
 	cache      *featureCache
 	instanceID string
+
+	// Zero-intrusion API fields
+	helpers    *HelperFunctions
+	tpsTracker *tpsTracker
 
 	mu sync.RWMutex
 }
@@ -102,6 +107,7 @@ func NewClientWithKeyPair(cfg *config.SDKConfig, keyPair *auth.KeyPair) (*Client
 		signer:     auth.NewRequestSigner(keyPair),
 		instanceID: instanceID,
 		cache:      &featureCache{ data: make(map[string]*cacheEntry), ttl: cfg.CacheTTL },
+		tpsTracker: newTPSTracker(),
 	}
 	return client, nil
 }
@@ -183,6 +189,67 @@ func (c *Client) CheckFeature(featureID string) (*FeatureStatus, error) {
 	return status, nil
 }
 
+// RegisterHelpers registers helper functions for zero-intrusion API usage.
+// This enables product-level limit checking without requiring featureID parameters.
+//
+// Required helpers:
+//   - CapacityCounter: MUST be provided if using capacity limits
+//
+// Optional helpers (SDK provides defaults if not specified):
+//   - QuotaConsumer: defaults to consuming 1 unit per call
+//   - TPSProvider: defaults to SDK internal TPS tracking
+//
+// Example:
+//   helpers := &client.HelperFunctions{
+//       QuotaConsumer: func(ctx context.Context, args ...interface{}) int {
+//           return calculateBatchSize(args)
+//       },
+//       CapacityCounter: func() int {
+//           return database.CountActiveUsers()
+//       },
+//   }
+//   client.RegisterHelpers(helpers)
+func (c *Client) RegisterHelpers(helpers *HelperFunctions) error {
+	if helpers == nil {
+		return fmt.Errorf("helpers cannot be nil")
+	}
+
+	// Validate required helpers
+	if err := helpers.Validate(); err != nil {
+		return fmt.Errorf("helper validation failed: %w", err)
+	}
+
+	// Set defaults for optional helpers
+	helpers.SetDefaults(c)
+
+	c.mu.Lock()
+	c.helpers = helpers
+	c.mu.Unlock()
+
+	return nil
+}
+
+// getInternalTPS returns the current TPS from the internal tracker
+func (c *Client) getInternalTPS() float64 {
+	if c.tpsTracker == nil {
+		return 0
+	}
+	return c.tpsTracker.getCurrentRate()
+}
+
+// checkProductLimits checks product-level limits (not feature-specific)
+// This is used by the zero-intrusion API methods
+func (c *Client) checkProductLimits() (*FeatureStatus, error) {
+	// Use a special product-level feature ID
+	// The server should recognize this and return product-level limits
+	return c.CheckFeature("__product__")
+}
+
+// reportProductUsage reports usage at the product level
+func (c *Client) reportProductUsage(amount int) error {
+	return c.ReportUsage("__product__", float64(amount))
+}
+
 // queryFeature queries LCC for feature status
 func (c *Client) queryFeature(featureID string) (*FeatureStatus, error) {
 	url := fmt.Sprintf("%s/api/v1/sdk/features/%s/check", c.baseURL, featureID)
@@ -233,10 +300,100 @@ func (c *Client) queryFeature(featureID string) (*FeatureStatus, error) {
 	}, nil
 }
 
-// Consume performs a consumption-style check+usage for an event-based feature.
+// ========== Zero-Intrusion Product-Level API (New) ==========
+
+// ReleaseFunc is a function that releases a concurrency slot
+type ReleaseFunc func()
+
+// Consume consumes quota from the product-level quota pool.
+// This is the zero-intrusion API that does not require featureID.
+//
+// The amount parameter specifies how many quota units to consume.
+// For simple use cases where each call consumes 1 unit, pass 1.
+//
+// Returns:
+//   - allowed: true if quota is available
+//   - remaining: remaining quota after consumption
+//   - error: any error during the check
+//
+// Example:
+//   allowed, remaining, err := client.Consume(1)
+//   if err != nil || !allowed {
+//       return fmt.Errorf("quota exceeded")
+//   }
+func (c *Client) Consume(amount int) (bool, int, error) {
+	// Record TPS for internal tracking
+	if c.tpsTracker != nil {
+		c.tpsTracker.RecordRequest()
+	}
+
+	// Check product-level quota
+	status, err := c.checkProductLimits()
+	if err != nil {
+		return false, 0, err
+	}
+
+	if !status.Enabled {
+		remaining := 0
+		if status.Quota != nil {
+			remaining = status.Quota.Remaining
+		}
+		return false, remaining, fmt.Errorf("quota exceeded: %s", status.Reason)
+	}
+
+	// Report usage
+	if err := c.reportProductUsage(amount); err != nil {
+		return false, 0, err
+	}
+
+	remaining := 0
+	if status.Quota != nil {
+		remaining = status.Quota.Remaining - amount
+		if remaining < 0 {
+			remaining = 0
+		}
+	}
+
+	return true, remaining, nil
+}
+
+// ConsumeWithContext uses the registered QuotaConsumer helper function
+// to calculate consumption amount based on function arguments.
+//
+// This is designed for code generator integration where the wrapper
+// function passes the original function arguments to calculate dynamic
+// consumption amounts.
+//
+// Returns:
+//   - allowed: true if quota is available
+//   - remaining: remaining quota after consumption
+//   - error: any error during the check
+//
+// Example:
+//   allowed, remaining, err := client.ConsumeWithContext(ctx, batchSize, userID)
+//   if err != nil || !allowed {
+//       return fmt.Errorf("quota exceeded")
+//   }
+func (c *Client) ConsumeWithContext(ctx context.Context, args ...interface{}) (bool, int, error) {
+	c.mu.RLock()
+	helpers := c.helpers
+	c.mu.RUnlock()
+
+	if helpers == nil || helpers.QuotaConsumer == nil {
+		return false, 0, fmt.Errorf("QuotaConsumer helper not registered")
+	}
+
+	amount := helpers.QuotaConsumer(ctx, args...)
+	return c.Consume(amount)
+}
+
+// ConsumeDeprecated performs a consumption-style check+usage for an event-based feature.
 // Typical use: MAXCALL, license generation, export count, etc.
 // It first checks the feature, then reports usage if allowed.
-func (c *Client) Consume(featureID string, amount int, meta map[string]any) (bool, int, string, error) {
+//
+// DEPRECATED: Use product-level Consume() or ConsumeWithContext() instead.
+// This method is kept for backward compatibility only.
+func (c *Client) ConsumeDeprecated(featureID string, amount int, meta map[string]any) (bool, int, string, error) {
 	status, err := c.CheckFeature(featureID)
 	if err != nil {
 		return false, 0, "check_error", err
@@ -266,9 +423,75 @@ func (c *Client) Consume(featureID string, amount int, meta map[string]any) (boo
 	return true, remaining, "ok", nil
 }
 
-// CheckCapacity compares an APP-provided currentUsed against the license-defined
+// CheckCapacity checks current usage against product-level capacity limit.
+// This is the zero-intrusion API that does not require featureID.
+//
+// The currentUsed parameter should be the current number of resources in use
+// (e.g., active users, open connections, created items).
+//
+// Returns:
+//   - allowed: true if capacity is available
+//   - maxCapacity: the maximum capacity limit
+//   - error: any error during the check
+//
+// Example:
+//   currentUsers := database.CountActiveUsers()
+//   allowed, max, err := client.CheckCapacity(currentUsers)
+//   if err != nil || !allowed {
+//       return fmt.Errorf("capacity exceeded: %d/%d", currentUsers, max)
+//   }
+func (c *Client) CheckCapacity(currentUsed int) (bool, int, error) {
+	status, err := c.checkProductLimits()
+	if err != nil {
+		return false, 0, err
+	}
+
+	maxCapacity := status.MaxCapacity
+	if maxCapacity <= 0 {
+		return false, 0, fmt.Errorf("no capacity limit configured")
+	}
+
+	if currentUsed >= maxCapacity {
+		return false, maxCapacity, fmt.Errorf("capacity exceeded: %d >= %d", currentUsed, maxCapacity)
+	}
+
+	return true, maxCapacity, nil
+}
+
+// CheckCapacityWithHelper uses the registered CapacityCounter helper function
+// to automatically get the current usage count.
+//
+// This requires that a CapacityCounter helper has been registered via RegisterHelpers().
+//
+// Returns:
+//   - allowed: true if capacity is available
+//   - maxCapacity: the maximum capacity limit
+//   - error: any error during the check
+//
+// Example:
+//   allowed, max, err := client.CheckCapacityWithHelper()
+//   if err != nil || !allowed {
+//       return fmt.Errorf("capacity exceeded")
+//   }
+func (c *Client) CheckCapacityWithHelper() (bool, int, error) {
+	c.mu.RLock()
+	helpers := c.helpers
+	c.mu.RUnlock()
+
+	if helpers == nil || helpers.CapacityCounter == nil {
+		return false, 0, fmt.Errorf("CapacityCounter helper not registered (required)")
+	}
+
+	currentUsed := helpers.CapacityCounter()
+	return c.CheckCapacity(currentUsed)
+}
+
+// CheckCapacityDeprecated compares an APP-provided currentUsed against the license-defined
 // MaxCapacity for the given feature. SDK does not compute current usage itself.
-func (c *Client) CheckCapacity(featureID string, currentUsed int) (bool, int, string, error) {
+//
+// DEPRECATED: Use product-level CheckCapacity() or CheckCapacityWithHelper() instead.
+// This method is kept for backward compatibility only.
+func (c *Client) CheckCapacityDeprecated(featureID string, currentUsed int) (bool, int, string, error) {
 	status, err := c.CheckFeature(featureID)
 	if err != nil {
 		return false, 0, "check_error", err
@@ -287,9 +510,62 @@ func (c *Client) CheckCapacity(featureID string, currentUsed int) (bool, int, st
 	return true, max, "ok", nil
 }
 
-// CheckTPS compares an APP-provided currentTPS against the license-defined
+// CheckTPS checks current TPS against product-level limit.
+// This is the zero-intrusion API that does not require featureID.
+//
+// Uses the registered TPSProvider helper if available, otherwise uses
+// SDK internal TPS tracking.
+//
+// Returns:
+//   - allowed: true if TPS is within limit
+//   - maxTPS: the maximum TPS limit
+//   - error: any error during the check
+//
+// Example:
+//   allowed, maxTPS, err := client.CheckTPS()
+//   if err != nil || !allowed {
+//       return fmt.Errorf("TPS exceeded: max=%.2f", maxTPS)
+//   }
+func (c *Client) CheckTPS() (bool, float64, error) {
+	// Get current TPS from helper or internal tracker
+	currentTPS := c.getCurrentTPS()
+
+	// Check against product limit
+	status, err := c.checkProductLimits()
+	if err != nil {
+		return false, 0, err
+	}
+
+	maxTPS := status.MaxTPS
+	if maxTPS <= 0 {
+		return true, 0, nil // No TPS limit configured
+	}
+
+	if currentTPS > maxTPS {
+		return false, maxTPS, fmt.Errorf("TPS exceeded: %.2f > %.2f", currentTPS, maxTPS)
+	}
+
+	return true, maxTPS, nil
+}
+
+// getCurrentTPS gets TPS from helper or internal tracker
+func (c *Client) getCurrentTPS() float64 {
+	c.mu.RLock()
+	helpers := c.helpers
+	c.mu.RUnlock()
+
+	if helpers != nil && helpers.TPSProvider != nil {
+		return helpers.TPSProvider()
+	}
+	return c.getInternalTPS()
+}
+
+// CheckTPSDeprecated compares an APP-provided currentTPS against the license-defined
 // MaxTPS for the given feature.
-func (c *Client) CheckTPS(featureID string, currentTPS float64) (bool, float64, string, error) {
+//
+// DEPRECATED: Use product-level CheckTPS() instead.
+// This method is kept for backward compatibility only.
+func (c *Client) CheckTPSDeprecated(featureID string, currentTPS float64) (bool, float64, string, error) {
 	status, err := c.CheckFeature(featureID)
 	if err != nil {
 		return false, 0, "check_error", err
@@ -307,10 +583,69 @@ func (c *Client) CheckTPS(featureID string, currentTPS float64) (bool, float64, 
 	return true, max, "ok", nil
 }
 
-// AcquireSlot implements a simple in-process concurrency control based on
+// AcquireSlot acquires a slot from the product-level concurrency pool.
+// This is the zero-intrusion API that does not require featureID.
+//
+// Returns a release function that MUST be called when the operation completes
+// to free the concurrency slot. Use defer to ensure proper cleanup.
+//
+// Returns:
+//   - release: function to release the slot (MUST be called)
+//   - allowed: true if slot was acquired
+//   - error: any error during the check
+//
+// Example:
+//   release, allowed, err := client.AcquireSlot()
+//   if err != nil || !allowed {
+//       return fmt.Errorf("concurrency limit exceeded")
+//   }
+//   defer release()
+//   // ... perform operation ...
+func (c *Client) AcquireSlot() (ReleaseFunc, bool, error) {
+	status, err := c.checkProductLimits()
+	if err != nil {
+		return func() {}, false, err
+	}
+
+	maxConcurrency := status.MaxConcurrency
+	if maxConcurrency <= 0 {
+		return func() {}, false, fmt.Errorf("no concurrency limit configured")
+	}
+
+	// Acquire from product-level pool
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	key := c.instanceID + "::__product__"
+	current := concurrencyState[key]
+
+	if current >= maxConcurrency {
+		return func() {}, false, fmt.Errorf("concurrency exceeded: %d >= %d", current, maxConcurrency)
+	}
+
+	concurrencyState[key] = current + 1
+
+	release := func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		cur := concurrencyState[key]
+		if cur <= 1 {
+			delete(concurrencyState, key)
+		} else {
+			concurrencyState[key] = cur - 1
+		}
+	}
+
+	return release, true, nil
+}
+
+// AcquireSlotDeprecated implements a simple in-process concurrency control based on
 // MaxConcurrency from the feature check. It returns a release function that
 // must be called to free the slot.
-func (c *Client) AcquireSlot(featureID string, meta map[string]any) (func(), bool, string, error) {
+//
+// DEPRECATED: Use product-level AcquireSlot() instead.
+// This method is kept for backward compatibility only.
+func (c *Client) AcquireSlotDeprecated(featureID string, meta map[string]any) (func(), bool, string, error) {
 	status, err := c.CheckFeature(featureID)
 	if err != nil {
 		return func() {}, false, "check_error", err

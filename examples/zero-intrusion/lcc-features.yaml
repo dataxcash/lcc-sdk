@@ -1,0 +1,52 @@
+sdk:
+  lcc_url: "http://localhost:7086"
+  product_id: "demo-app"
+  product_version: "2.0.0"
+  
+  # Product-level limits (Zero-Intrusion API)
+  # These limits apply to the entire product, not individual features
+  limits:
+    # Quota configuration - maximum usage per time window
+    quota:
+      max: 1000
+      window: "24h"
+    
+    # Maximum transactions per second
+    max_tps: 100.0
+    
+    # Maximum capacity (e.g., max concurrent users, max open connections)
+    max_capacity: 500
+    
+    # Maximum concurrent operations
+    max_concurrency: 10
+    
+    # Optional: Helper function references for code generator
+    # These specify which helper functions to call for dynamic behavior
+    consumer: "calculateBatchSize"          # QuotaConsumer function name
+    tps_provider: "getCurrentTPS"           # TPSProvider function name
+    capacity_counter: "countActiveUsers"    # CapacityCounter function name
+
+# Features define interception points, not limits
+# Limits are defined at product level above
+features:
+  - id: "feature-export"
+    name: "Data Export"
+    description: "Export data to various formats"
+    intercept:
+      package: "export"
+      function: "ExportData"
+    on_deny:
+      action: "error"
+      message: "Export feature requires valid license"
+  
+  - id: "feature-analytics"
+    name: "Advanced Analytics"
+    description: "ML-powered analytics"
+    intercept:
+      package: "analytics"
+      function: "RunAnalytics"
+    fallback:
+      package: "analytics"
+      function: "BasicAnalytics"
+    on_deny:
+      action: "fallback"

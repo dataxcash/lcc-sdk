@@ -18,6 +18,10 @@ type SDKConfig struct {
 	FailOpen       bool          `yaml:"fail_open"`
 	Timeout        time.Duration `yaml:"timeout"`
 	MaxRetries     int           `yaml:"max_retries"`
+
+	// Product-level limits (Zero-Intrusion API)
+	// These limits apply to the entire product, not individual features
+	Limits *ProductLimits `yaml:"limits,omitempty"`
 }
 
 // FeatureConfig defines a single protected feature
@@ -131,6 +135,13 @@ func (c *SDKConfig) Validate() error {
 	}
 	if c.MaxRetries == 0 {
 		c.MaxRetries = 3
+	}
+
+	// Validate product limits if present
+	if c.Limits != nil {
+		if err := c.Limits.Validate(); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -253,4 +264,97 @@ func GetDefaults() *Manifest {
 		},
 		Features: []FeatureConfig{},
 	}
+}
+
+// ProductLimits defines product-level limits for zero-intrusion API.
+// These limits apply to the entire product, not individual features.
+// This enables the zero-intrusion API where featureID is not required.
+type ProductLimits struct {
+	// Quota configuration for product-level consumption tracking
+	Quota *ProductQuotaConfig `yaml:"quota,omitempty"`
+
+	// MaxTPS defines maximum transactions per second limit
+	MaxTPS float64 `yaml:"max_tps,omitempty"`
+
+	// MaxCapacity defines maximum capacity limit (e.g., max users, max connections)
+	MaxCapacity int `yaml:"max_capacity,omitempty"`
+
+	// MaxConcurrency defines maximum concurrent operations limit
+	MaxConcurrency int `yaml:"max_concurrency,omitempty"`
+
+	// Helper function references (for code generator)
+	// These specify which helper functions to call for dynamic behavior
+
+	// Consumer is the name of the QuotaConsumer helper function (optional)
+	// Example: "calculateBatchSize"
+	Consumer string `yaml:"consumer,omitempty"`
+
+	// TPSProvider is the name of the TPSProvider helper function (optional)
+	// Example: "getCurrentTPS"
+	TPSProvider string `yaml:"tps_provider,omitempty"`
+
+	// CapacityCounter is the name of the CapacityCounter helper function (required for capacity limits)
+	// Example: "countActiveUsers"
+	CapacityCounter string `yaml:"capacity_counter,omitempty"`
+}
+
+// ProductQuotaConfig defines quota configuration for product-level limits
+type ProductQuotaConfig struct {
+	// Max is the maximum number of quota units allowed
+	Max int `yaml:"max"`
+
+	// Window is the time window for quota calculation
+	// Examples: "1h", "24h", "30d"
+	Window string `yaml:"window"`
+}
+
+// Validate validates product limits configuration
+func (p *ProductLimits) Validate() error {
+	if p == nil {
+		return nil // Product limits are optional
+	}
+
+	// Validate quota if present
+	if p.Quota != nil {
+		if p.Quota.Max <= 0 {
+			return &ValidationError{
+				Field:   "limits.quota.max",
+				Message: "must be positive",
+			}
+		}
+		if p.Quota.Window == "" {
+			return &ValidationError{
+				Field:   "limits.quota.window",
+				Message: "required",
+			}
+		}
+	}
+
+	// Validate numeric limits are non-negative
+	if p.MaxTPS < 0 {
+		return &ValidationError{
+			Field:   "limits.max_tps",
+			Message: "must be non-negative",
+		}
+	}
+	if p.MaxCapacity < 0 {
+		return &ValidationError{
+			Field:   "limits.max_capacity",
+			Message: "must be non-negative",
+		}
+	}
+	if p.MaxConcurrency < 0 {
+		return &ValidationError{
+			Field:   "limits.max_concurrency",
+			Message: "must be non-negative",
+		}
+	}
+
+	// Warn if capacity limit is defined but no counter helper is specified
+	if p.MaxCapacity > 0 && p.CapacityCounter == "" {
+		// Note: This is a warning, not an error, because the helper can be
+		// registered programmatically via RegisterHelpers()
+	}
+
+	return nil
 }

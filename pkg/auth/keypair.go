@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"os"
 )
 
 // KeyPair represents an RSA key pair for self-signed authentication
@@ -29,6 +30,55 @@ func GenerateKeyPair() (*KeyPair, error) {
 		privateKey: privateKey,
 		publicKey:  &privateKey.PublicKey,
 	}, nil
+}
+
+// NewKeyPairFromPrivateKey wraps an existing private key into KeyPair
+func NewKeyPairFromPrivateKey(priv *rsa.PrivateKey) *KeyPair {
+	if priv == nil { return nil }
+	return &KeyPair{ privateKey: priv, publicKey: &priv.PublicKey }
+}
+
+// ExportPrivateKeyPEM returns PKCS#1 PEM for the RSA private key
+func (kp *KeyPair) ExportPrivateKeyPEM() (string, error) {
+	if kp.privateKey == nil {
+		return "", fmt.Errorf("private key is nil")
+	}
+	b := x509.MarshalPKCS1PrivateKey(kp.privateKey)
+	blk := &pem.Block{ Type: "RSA PRIVATE KEY", Bytes: b }
+	pemBytes := pem.EncodeToMemory(blk)
+	return string(pemBytes), nil
+}
+
+// ParseRSAPrivateKeyFromPEM parses a PKCS#1 PEM private key
+func ParseRSAPrivateKeyFromPEM(pemData []byte) (*rsa.PrivateKey, error) {
+	block, _ := pem.Decode(pemData)
+	if block == nil {
+		return nil, fmt.Errorf("failed to decode PEM block")
+	}
+	if block.Type != "RSA PRIVATE KEY" {
+		return nil, fmt.Errorf("invalid PEM type: %s", block.Type)
+	}
+	priv, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
+	}
+	return priv, nil
+}
+
+// SavePrivateKeyPEMFile saves private key PEM to file with 0600 perms
+func (kp *KeyPair) SavePrivateKeyPEMFile(path string) error {
+	pemStr, err := kp.ExportPrivateKeyPEM()
+	if err != nil { return err }
+	return os.WriteFile(path, []byte(pemStr), 0600)
+}
+
+// LoadKeyPairFromPEMFile loads KeyPair from a PKCS#1 PEM private key file
+func LoadKeyPairFromPEMFile(path string) (*KeyPair, error) {
+	b, err := os.ReadFile(path)
+	if err != nil { return nil, err }
+	priv, err := ParseRSAPrivateKeyFromPEM(b)
+	if err != nil { return nil, err }
+	return NewKeyPairFromPrivateKey(priv), nil
 }
 
 // Sign signs data using the private key with PKCS#1 v1.5 padding
