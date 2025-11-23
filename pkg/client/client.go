@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -36,7 +38,7 @@ type Client struct {
 	// Heartbeat management
 	heartbeatInterval time.Duration
 	heartbeatCancel   context.CancelFunc
-	heartbeatRunning  bool
+	heartbeatOnce     sync.Once
 
 	// Zero-intrusion API fields
 	helpers    *HelperFunctions
@@ -87,6 +89,15 @@ var concurrencyState = make(map[string]int)
 
 const defaultHeartbeatInterval = 5 * time.Second
 
+// debugLogf writes SDK debug logs when LCC_SDK_DEBUG is set.
+// Logs are printed to stdout with a consistent prefix.
+func debugLogf(format string, args ...interface{}) {
+	if os.Getenv("LCC_SDK_DEBUG") == "" {
+		return
+	}
+	fmt.Printf("[LCC-SDK-DEBUG] "+format+"\n", args...)
+}
+
 // NewClient creates a new LCC client using a freshly generated key pair
 func NewClient(cfg *config.SDKConfig) (*Client, error) {
 	kp, err := auth.GenerateKeyPair()
@@ -120,50 +131,81 @@ func NewClientWithKeyPair(cfg *config.SDKConfig, keyPair *auth.KeyPair) (*Client
 	}
 	return client, nil
 }
+// SetHTTPClient allows setting a custom HTTP client (e.g., for TLS config)
+func (c *Client) SetHTTPClient(client *http.Client) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.httpClient = client
+}
+
 // Register registers this application instance with LCC
 func (c *Client) Register() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+
+	debugLogf("Register called: baseURL=%s productID=%s version=%s", c.baseURL, c.productID, c.productVer)
 
 	pubPEM, err := c.keyPair.GetPublicKeyPEM()
 	if err != nil {
+		c.mu.Unlock()
 		return fmt.Errorf("failed to export public key: %w", err)
 	}
+
+	// Get local IP and hostname for topology display
+	ip := getLocalIP()
+	hostname, _ := os.Hostname()
 
 	reqBody := map[string]interface{}{
 		"product_id": c.productID,
 		"version":    c.productVer,
 		"public_key": pubPEM,
+		"metadata": map[string]interface{}{
+			"ip":       ip,
+			"hostname": hostname,
+		},
 	}
 
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
+		c.mu.Unlock()
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", c.baseURL+"/api/v1/sdk/register", bytes.NewReader(bodyBytes))
+	url := c.baseURL + "/api/v1/sdk/register"
+	debugLogf("Register: creating POST %s", url)
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
+		c.mu.Unlock()
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
 	// Sign request
 	if err := c.signer.SignRequest(req); err != nil {
+		c.mu.Unlock()
 		return fmt.Errorf("failed to sign request: %w", err)
 	}
 
+	c.mu.Unlock() // Release lock before HTTP call to avoid blocking heartbeat goroutine
+
+	debugLogf("Register: executing HTTP request (timeout=%s)...", c.httpClient.Timeout)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		debugLogf("Register: HTTP request error: %v", err)
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	debugLogf("Register: HTTP response status=%d", resp.StatusCode)
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		debugLogf("Register: non-200 response body=%s", string(body))
 		return fmt.Errorf("registration failed: status=%d, body=%s", resp.StatusCode, string(body))
 	}
 
 	// Start background heartbeat loop after successful registration
 	c.startHeartbeatLoop()
+	debugLogf("Register: heartbeat loop started for instance %s", c.instanceID)
 
 	return nil
 }
@@ -261,36 +303,41 @@ func (c *Client) reportProductUsage(amount int) error {
 	return c.ReportUsage("__product__", float64(amount))
 }
 
-// startHeartbeatLoop starts a background goroutine that periodically
-// sends heartbeat requests to LCC. It is idempotent and safe to call
-// multiple times; only a single loop will run.
-func (c *Client) startHeartbeatLoop() {
+// SetHeartbeatInterval sets the heartbeat interval. Set to 0 to disable heartbeat.
+func (c *Client) SetHeartbeatInterval(interval time.Duration) {
 	c.mu.Lock()
-	if c.heartbeatRunning {
-		c.mu.Unlock()
-		return
-	}
-	interval := c.heartbeatInterval
-	if interval <= 0 {
-		interval = defaultHeartbeatInterval
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	c.heartbeatCancel = cancel
-	c.heartbeatRunning = true
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	c.heartbeatInterval = interval
+}
 
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				_ = c.sendHeartbeat()
-			}
+// startHeartbeatLoop starts a background goroutine that periodically
+// sends heartbeat requests to LCC. Uses sync.Once to ensure only one
+// heartbeat goroutine is created per client instance.
+func (c *Client) startHeartbeatLoop() {
+	c.heartbeatOnce.Do(func() {
+		interval := c.heartbeatInterval
+		if interval <= 0 {
+			interval = defaultHeartbeatInterval
 		}
-	}()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		c.heartbeatCancel = cancel
+
+		go func() {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					_ = c.sendHeartbeat()
+				}
+			}
+		}()
+
+		debugLogf("Heartbeat loop started for instance %s", c.instanceID)
+	})
 }
 
 // sendHeartbeat sends a single heartbeat request to LCC.
@@ -825,7 +872,6 @@ func (c *Client) Close() error {
 	if c.heartbeatCancel != nil {
 		c.heartbeatCancel()
 		c.heartbeatCancel = nil
-		c.heartbeatRunning = false
 	}
 
 	if c.keyPair != nil {
@@ -875,4 +921,20 @@ func (fc *featureCache) clear() {
 // ClearCache clears the feature cache
 func (c *Client) ClearCache() {
 	c.cache.clear()
+}
+
+// getLocalIP returns the local non-loopback IP address
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "unknown"
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
+			}
+		}
+	}
+	return "unknown"
 }
