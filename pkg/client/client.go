@@ -33,6 +33,11 @@ type Client struct {
 	cache      *featureCache
 	instanceID string
 
+	// Heartbeat management
+	heartbeatInterval time.Duration
+	heartbeatCancel   context.CancelFunc
+	heartbeatRunning  bool
+
 	// Zero-intrusion API fields
 	helpers    *HelperFunctions
 	tpsTracker *tpsTracker
@@ -80,6 +85,8 @@ type cacheEntry struct {
 // lifecycle management.
 var concurrencyState = make(map[string]int)
 
+const defaultHeartbeatInterval = 5 * time.Second
+
 // NewClient creates a new LCC client using a freshly generated key pair
 func NewClient(cfg *config.SDKConfig) (*Client, error) {
 	kp, err := auth.GenerateKeyPair()
@@ -102,16 +109,17 @@ func NewClientWithKeyPair(cfg *config.SDKConfig, keyPair *auth.KeyPair) (*Client
 		baseURL:    cfg.LCCURL,
 		productID:  cfg.ProductID,
 		productVer: cfg.ProductVersion,
-		httpClient: &http.Client{ Timeout: cfg.Timeout },
-		keyPair:    keyPair,
-		signer:     auth.NewRequestSigner(keyPair),
-		instanceID: instanceID,
-		cache:      &featureCache{ data: make(map[string]*cacheEntry), ttl: cfg.CacheTTL },
-		tpsTracker: newTPSTracker(),
+
+		httpClient: &http.Client{Timeout: cfg.Timeout},
+		keyPair:   keyPair,
+		signer:    auth.NewRequestSigner(keyPair),
+		cache:     &featureCache{data: make(map[string]*cacheEntry), ttl: cfg.CacheTTL},
+		instanceID:          instanceID,
+		heartbeatInterval:   defaultHeartbeatInterval,
+		tpsTracker:          newTPSTracker(),
 	}
 	return client, nil
 }
-
 // Register registers this application instance with LCC
 func (c *Client) Register() error {
 	c.mu.Lock()
@@ -153,6 +161,9 @@ func (c *Client) Register() error {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("registration failed: status=%d, body=%s", resp.StatusCode, string(body))
 	}
+
+	// Start background heartbeat loop after successful registration
+	c.startHeartbeatLoop()
 
 	return nil
 }
@@ -248,6 +259,71 @@ func (c *Client) checkProductLimits() (*FeatureStatus, error) {
 // reportProductUsage reports usage at the product level
 func (c *Client) reportProductUsage(amount int) error {
 	return c.ReportUsage("__product__", float64(amount))
+}
+
+// startHeartbeatLoop starts a background goroutine that periodically
+// sends heartbeat requests to LCC. It is idempotent and safe to call
+// multiple times; only a single loop will run.
+func (c *Client) startHeartbeatLoop() {
+	c.mu.Lock()
+	if c.heartbeatRunning {
+		c.mu.Unlock()
+		return
+	}
+	interval := c.heartbeatInterval
+	if interval <= 0 {
+		interval = defaultHeartbeatInterval
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.heartbeatCancel = cancel
+	c.heartbeatRunning = true
+	c.mu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = c.sendHeartbeat()
+			}
+		}
+	}()
+}
+
+// sendHeartbeat sends a single heartbeat request to LCC.
+// Errors are returned to the caller but are not retried here.
+func (c *Client) sendHeartbeat() error {
+	payload := map[string]interface{}{
+		"version": c.productVer,
+	}
+
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal heartbeat payload: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", c.baseURL+"/api/v1/sdk/heartbeat", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("failed to create heartbeat request: %w", err)
+	}
+
+	if err := c.signer.SignRequest(req); err != nil {
+		return fmt.Errorf("failed to sign heartbeat request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("heartbeat request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Drain response body and ignore content; heartbeat is best-effort
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	return nil
 }
 
 // queryFeature queries LCC for feature status
@@ -744,6 +820,13 @@ func (c *Client) GetInstanceID() string {
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Stop heartbeat loop if running
+	if c.heartbeatCancel != nil {
+		c.heartbeatCancel()
+		c.heartbeatCancel = nil
+		c.heartbeatRunning = false
+	}
 
 	if c.keyPair != nil {
 		c.keyPair.Destroy()
