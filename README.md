@@ -74,8 +74,16 @@ func main() {
 
 ## Documentation
 
+### Quick Start
 - [Getting Started Guide](docs/getting-started.md)
 - [Configuration Reference](docs/configuration.md)
+
+### Feature & Capability Documentation
+- [LCC Features Overview](docs/lcc-features.md) - Complete feature set and capabilities
+- [Feature Comparison Guide](docs/feature-comparison.md) - Compare LCC features across different scenarios
+- [Best Practices Guide](docs/lcc-best-practices.md) - Implementation best practices and patterns
+
+### Advanced Topics
 - [API Documentation](docs/api-reference.md)
 - [Code Generation Guide](docs/codegen.md)
 
